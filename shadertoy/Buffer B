@@ -1,0 +1,211 @@
+// Buffer B renders god rays, shadows and ambient occlusion
+// (by marching the terrain buffer depth).
+
+#define SAMPLE_COUNT_ATMOSPHERE_OCCLUSION 4.0
+#define SAMPLE_COUNT_SHADOWS 4.0
+#define SAMPLE_COUNT_CLOUD_SHADOWS 2.0
+#define SAMPLE_COUNT_AMBIENT_OCCLUSION 4.0
+#define SHADOW_RANGE 1000.0
+#define AMBIENT_OCCLUSION_RANGE 750.0
+#define CLOUD_SHADOW_RANGE 20000.0
+
+uint Hash(uint s)
+{
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s;
+}
+float Random(uint seed)
+{
+    return float(Hash(seed)) / 4294967295.0;
+}
+float3 RandomUnitVector(uint seed)
+{
+    float PI2 = 6.28318530718;
+    float z = 1.0 - 2.0 * Random(seed);
+    float xy = sqrt(1.0 - z * z);
+    float r = Random(seed + 1u);
+    float sn = sin(PI2 * r);
+    float cs = cos(PI2 * r);
+    return float3(sn * xy, cs * xy, z);
+}
+
+float GetCloudShadow(vec2 uv, float rl, float thickness)
+{
+#ifdef ENABLE_CLOUDS
+    vec4 clouds = texture(iChannel3, uv);
+    float opacity = exp(-abs(rl - clouds.w) / thickness);
+    return max(0.0, 1.0 - clouds.z * opacity);
+#else
+    return 1.0;
+#endif
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    vec4 mouse = iMouse / iResolution.xyxy;
+    float time = -iTime * 0.2 + 3.5;
+    vec2 sunPos = 0.5 + vec2(cos(time) * 0.4, sin(time) * 0.45);
+    if (iMouse.x > 10.0)
+    {
+        sunPos = mouse.xy;
+    }
+    vec3 sunDir;
+    vec3 foo;
+    GetCamera(sunPos, iResolution, foo, sunDir);
+    
+    const vec3 moonDir = normalize(vec3(0.5, 0.25, 1));
+    
+    vec2 uv = fragCoord / iResolution.xy;
+    
+    vec3 ro, rd;
+    GetCamera(uv, iResolution, ro, rd);
+    
+    float dither = textureLod(iChannel2, uv * iResolution.xy / vec2(1024), 0.0).x;
+    dither = fract(dither + (0.61803398875 * float(iFrame & 255)));
+    
+    float atmosphereOcclusion = 1.0;
+    float shadow = 1.0;
+    float shadow2 = 1.0;
+    float ambientOcclusion = 1.0;
+    
+#ifdef ENABLE_ATMOSPHERE_OCCLUSION
+    atmosphereOcclusion = 0.0;
+    for (float i = 0.0; i < SAMPLE_COUNT_ATMOSPHERE_OCCLUSION; i++)
+    {
+        float delta = (i + dither) / SAMPLE_COUNT_ATMOSPHERE_OCCLUSION;
+        vec2 localUV = mix(uv, sunPos, delta);
+        
+        float cloud = GetCloudShadow(localUV, delta * 1e10, 1e12);
+        
+#ifdef ENABLE_TERRAIN
+        float terrain = (texture(iChannel0, localUV).x > 0.0 ? 0.0 : 1.0);
+#else
+        float terrain = 1.0;
+#endif
+        
+        atmosphereOcclusion += terrain * cloud;
+    }
+    atmosphereOcclusion /= SAMPLE_COUNT_ATMOSPHERE_OCCLUSION;
+#endif
+
+    vec4 terrain = texture(iChannel0, uv);
+    vec3 p = ro + rd * terrain.x * 0.998;
+    vec3 n = ExpandPackedNormal(terrain.yz);
+    
+#if defined(ENABLE_SHADOWS) && defined(ENABLE_TERRAIN)
+    if (terrain.x > 0.0)
+    {
+        for (float i = 0.0; i < SAMPLE_COUNT_SHADOWS; i++)
+        {
+            float delta = (i + dither) / SAMPLE_COUNT_SHADOWS;
+            vec3 localP = p + sunDir * delta * SHADOW_RANGE;
+            vec3 dir = localP - ro;
+            float dist = length(dir);
+            dir /= dist;
+            vec2 localUV = GetUV(dir, iResolution);
+            vec4 localTerrain = texture(iChannel0, localUV);
+            float occluder = localTerrain.x - dist;
+            //shadow *= localTerrain.x < 0.0 || occluder > 0.0 || occluder < -SHADOW_RANGE ? 1.0 : 0.0;
+            if (localTerrain.x > 0.0 && -occluder < SHADOW_RANGE)
+            {
+                shadow *= occluder > 0.0 ? 1.0 : 0.0;
+            }
+            
+            localP = p + moonDir * delta * SHADOW_RANGE;
+            dir = localP - ro;
+            dist = length(dir);
+            dir /= dist;
+            localUV = GetUV(dir, iResolution);
+            localTerrain = texture(iChannel0, localUV);
+            occluder = localTerrain.x - dist;
+            shadow2 *= localTerrain.x < 0.0 || occluder > 0.0 || occluder < -SHADOW_RANGE ? 1.0 : 0.0;
+        }
+        
+    #ifdef ENABLE_CLOUDS
+        for (float i = 0.0; i < SAMPLE_COUNT_CLOUD_SHADOWS; i++)
+        {
+            float delta = (i + dither) / SAMPLE_COUNT_CLOUD_SHADOWS;
+            vec3 localP = p + sunDir * delta * CLOUD_SHADOW_RANGE;
+            vec3 dir = localP - ro;
+            float dist = length(dir);
+            dir /= dist;
+            vec2 localUV = GetUV(dir, iResolution);
+            vec4 localTerrain = texture(iChannel0, localUV);
+            float occluder = localTerrain.x - dist;
+            shadow *= GetCloudShadow(localUV, dist, 1e5);
+            
+            localP = p + moonDir * delta * CLOUD_SHADOW_RANGE;
+            dir = localP - ro;
+            dist = length(dir);
+            dir /= dist;
+            localUV = GetUV(dir, iResolution);
+            localTerrain = texture(iChannel0, localUV);
+            occluder = localTerrain.x - dist;    
+            shadow2 *= GetCloudShadow(localUV, dist, 1e5);
+        }
+    #endif
+    }
+#endif
+
+#ifdef ENABLE_AMBIENT_OCCLUSION
+    ambientOcclusion = 0.0;
+    float cloudOcclusion = 1.0;
+    if (terrain.x > 0.0)
+    {
+        ivec2 iFragCoord = ivec2(fragCoord.xy);
+        vec3 sampleDir = RandomUnitVector(uint(iFrame * iFragCoord.x * iFragCoord.y + iFragCoord.x + iFragCoord.y * int(iResolution.x)));
+        sampleDir *= sign(dot(sampleDir, n));
+        sampleDir = normalize(sampleDir);
+        for (float i = 0.0; i < SAMPLE_COUNT_AMBIENT_OCCLUSION; i++)
+        {
+            float delta = (i + dither) / SAMPLE_COUNT_AMBIENT_OCCLUSION;
+            vec3 localP = p + sampleDir * delta * AMBIENT_OCCLUSION_RANGE;
+            vec3 dir = localP - ro;
+            float dist = length(dir);
+            dir /= dist;
+            vec2 localUV = GetUV(dir, iResolution);
+            vec4 localTerrain = texture(iChannel0, localUV);
+            float occluder = localTerrain.x - dist;
+            float cloud = pow(GetCloudShadow(localUV, dist, 1e5), 0.05);
+            ambientOcclusion += (localTerrain.x < 0.0 || occluder > 0.0 || occluder < -AMBIENT_OCCLUSION_RANGE ? 1.0 : 0.0) * cloud;
+        }
+        ambientOcclusion /= SAMPLE_COUNT_AMBIENT_OCCLUSION;
+        ambientOcclusion = ambientOcclusion;
+    }
+    else
+    {
+        ambientOcclusion = 1.0;
+    }
+#endif
+
+    vec4 prev = texture(iChannel1, uv);
+    
+    vec4 prevData = texture(iChannel1, vec2(0.0));
+    float screenHash = iResolution.x + iResolution.y;
+    float screenHashPrev = prevData.z;
+    float sunHash = sunPos.x + sunPos.y;
+    float sunHashPrev = prevData.w;
+    
+    float temporalStability = GetTemporalStability(iFrame, sunHash, sunHashPrev, TEMPORAL_ACCUMULATION_LIGHTING, 50.0);
+    atmosphereOcclusion = mix(atmosphereOcclusion, prev.x, temporalStability);
+    
+    temporalStability = GetTemporalStability(iFrame, sunHash, sunHashPrev, TEMPORAL_ACCUMULATION_LIGHTING, 20.0);
+    shadow = mix(shadow, prev.y, temporalStability);
+    shadow2 = mix(shadow2, prev.z, temporalStability);
+    
+    temporalStability = GetTemporalStability(iFrame, screenHash, screenHashPrev, TEMPORAL_ACCUMULATION_LIGHTING, 20.0);
+    ambientOcclusion = mix(ambientOcclusion, prev.w, temporalStability);
+    
+    fragColor = vec4(atmosphereOcclusion, shadow, shadow2, ambientOcclusion);
+    if (fragCoord.x < 1.0 && fragCoord.y < 1.0)
+    {
+        // Store some data in corner pixel
+        fragColor.z = screenHash;
+        fragColor.w = sunHash;
+    }
+}
