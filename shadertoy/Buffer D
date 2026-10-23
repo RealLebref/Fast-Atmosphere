@@ -1,0 +1,427 @@
+// Render the image
+
+// Sample Buffer A (terrain), Buffer B (god rays/shadow/ambient occlusion) and Buffer C (clouds),
+// then composite with atmosphere from Common and apply color grading etc.
+
+#define HEIGHT_FOG_DIST_WEIGHT 1e-4
+#define HEIGHT_FOG_COLOR vec3(0.8, 0.9, 1.0)
+
+#define AMBIENT_DIR_BIAS 4.0
+
+struct Light
+{
+    vec3 direction;
+    vec3 radiance;
+};
+
+vec3 TonemapACES(vec3 color)
+{
+    return (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+}
+
+float GetFogWeight(vec3 ro, vec3 rd, float rl, float h)
+{
+#ifdef ENABLE_HEIGHT_FOG
+    vec2 fogt = SphereIntersection(ro, rd, PLANET_CENTER, PLANET_RADIUS + HEIGHT_FOG_PLANE);
+    fogt.x = max(0.0, fogt.x);
+    fogt.y = min(fogt.y, rl);
+    int sc = 4;
+    float ss = (fogt.y - fogt.x) / float(sc);
+    float od = 0.0;
+    for (int i = 0; i < sc; i++)
+    {
+        float delta = (float(i) + 0.5) / float(sc);
+        vec3 p = ro + rd * mix(fogt.x, fogt.y, delta);
+        float y = distance(p, PLANET_CENTER) - PLANET_RADIUS;
+        float f = max(0.0, sq(1.0 - y / HEIGHT_FOG_PLANE));
+        od += f * ss;
+    }
+    return 1.0 - exp(-od * HEIGHT_FOG_DENSITY);
+#else
+    return 0.0;
+#endif
+}
+
+vec4 GetTerrain(vec2 uv, vec3 ro, vec3 rd, Light light1, Light light2)
+{
+    vec3 color = vec3(0.0);
+    vec4 terrain = texture(iChannel0, uv);
+    if (terrain.x < 0.0)
+    {
+        return vec4(-1, color);
+    }
+    
+    vec4 occlusionTex = texture(iChannel1, uv);
+    float atmosphereOcclusion = occlusionTex.x;
+    float shadow = occlusionTex.y;
+    float shadow2 = occlusionTex.z;
+    float ambientOcclusion = pow8(occlusionTex.w);
+
+    vec3 p = ro + rd * terrain.x;
+
+    vec3 n = ExpandPackedNormal(terrain.yz);
+    
+    vec4 terrain1 = texture(iChannel0, uv + vec2(1, 0) / iResolution.xy);
+    vec4 terrain2 = texture(iChannel0, uv + vec2(0, 1) / iResolution.xy);
+    vec4 terrain3 = texture(iChannel0, uv - vec2(1, 0) / iResolution.xy);
+    vec4 terrain4 = texture(iChannel0, uv - vec2(0, 1) / iResolution.xy);
+    vec3 n1 = ExpandPackedNormal(terrain1.yz);
+    vec3 n2 = ExpandPackedNormal(terrain2.yz);
+    vec3 n3 = ExpandPackedNormal(terrain3.yz);
+    vec3 n4 = ExpandPackedNormal(terrain4.yz);
+
+    //float edge = pow(1.0 - ((dot(n1, n3) + dot(n2, n4)) / 4.0 + 0.5), 0.15);
+    float edge = 1.0 - terrain.w;
+    //float edge = dot(n1, n3) + dot(n2, n4);
+    //edge = smoothstep(0.15, 0.5, edge);
+    //edge = step(0.2, edge);
+
+    const vec3 cliffAlbedo = vec3(0.2);
+    const vec3 grassAlbedo = vec3(0.1, 0.17, 0.05);
+    const vec3 sandAlbedo = vec3(0.4, 0.3, 0.2);
+    const vec3 snowAlbedo = vec3(0.8);
+
+    vec3 cliff = mix(cliffAlbedo, vec3(0.4), smoothstep(0.0, 0.08, edge));
+    //vec3 albedo = cliff;
+
+    vec3 grass = mix(grassAlbedo, vec3(0.5, 0.4, 0.3), smoothstep(0.02, 0.1, edge));
+
+    vec3 albedo;
+    albedo = mix(cliff, grass, smoothstep(0.9, 0.95, n.y)); // Grass
+    albedo = mix(albedo, snowAlbedo, smoothstep(0.8, 0.81, n.y) * smoothstep(900.0, 1300.0, p.y)); // Snow
+
+    //albedo = vec3(0.3);
+    
+    //albedo *= max(0.0, 1.0 + (edge - 0.5) * 10.0);
+    //albedo *= 0.5 + edge;
+    //albedo = vec3(edge);
+
+#ifdef ENABLE_WATER
+    float beachWeight = smoothstep(15.0, -15.0, p.y - WATER_HEIGHT);
+    albedo = mix(albedo, sandAlbedo, beachWeight);
+    albedo *= exp(-max(0.0, WATER_HEIGHT - p.y) * 0.05);
+#endif
+
+#ifdef DEBUG_LIGHTING
+    albedo = vec3(1.0);
+#endif
+#ifdef DEBUG_ALBEDO
+    return vec4(terrain.x, albedo);
+#endif
+#ifdef DEBUG_NORMAL
+    return vec4(terrain.x, n * 0.5 + 0.5);
+#endif
+
+    //albedo = vec3(0.5);
+
+    // Color light by transmittance
+    vec3 light1Transmittance = GetLightTransmittance(p, light1.direction);
+
+    const float pdf = 1.0 / PI;
+
+#ifdef ENABLE_WATER
+    float waterShadow = exp(-max(0.0, WATER_HEIGHT - p.y) * 0.1);
+    shadow *= waterShadow;
+    shadow2 *= waterShadow;
+#endif
+
+    // Direct
+    float ndotl = dot(n, light1.direction);
+    color += albedo * clamp(ndotl, 0.0, 1.0) * pdf * light1.radiance * light1Transmittance * shadow;
+#ifdef ENABLE_MOON_LIGHT
+    vec3 light2Transmittance = GetLightTransmittance(p, light2.direction);
+    ndotl = dot(n, light2.direction);
+    color += albedo * clamp(ndotl, 0.0, 1.0) * pdf * light2.radiance * light2Transmittance * shadow2;
+#endif
+
+    // Ambient
+    vec3 ad = normalize(vec3(0, 1, 0) + n * AMBIENT_DIR_BIAS);
+#ifdef ENABLE_ATMOSPHERE
+    vec3 al = GetAtmosphere(p, ad, INFINITY, light1.direction, light1.radiance);
+    #ifdef ENABLE_MOON_LIGHT
+    al += GetAtmosphere(p, ad, INFINITY, light2.direction, light2.radiance);
+    #endif
+#else
+    vec3 al = vec3(0.0);
+#endif
+    vec3 bounceAlbedo = (cliffAlbedo + grassAlbedo + sandAlbedo + snowAlbedo) / 4.0;
+    al += (light1.radiance * light1Transmittance
+#ifdef ENABLE_MOON_LIGHT
+        + light2.radiance * light2Transmittance
+#endif
+        ) * (1.0 - n.y * 0.75) * bounceAlbedo * 0.05; // Terrible fake bounce
+    color += albedo * al * (2.0 * PI) * pdf * sq(ambientOcclusion);
+
+    return vec4(terrain.x, color);
+}
+
+vec4 ResolveClouds(vec4 clouds, vec3 ro, vec3 rd, Light light1, Light light2, float atmosphereOcclusion)
+{
+    float cloudDepth = clouds.w;
+    float cloudAlpha = clamp(clouds.z + 1e-5, 0.0, 1.0);
+    vec3 cloudPos = ro + rd * cloudDepth;
+    
+    float fogWeight = GetFogWeight(ro, rd, cloudDepth, cloudPos.y);
+    vec4 transmittance;
+    vec3 scattering = GetAtmosphere(ro, rd, cloudDepth, light1.direction, light1.radiance, transmittance, vec4(HEIGHT_FOG_COLOR, fogWeight), atmosphereOcclusion);
+#ifdef ENABLE_ATMOSPHERE
+    vec3 al = GetAtmosphere(cloudPos, vec3(0, 1, 0), INFINITY, light1.direction, light1.radiance);
+#else
+    vec3 al = vec3(0.0);
+#endif
+#ifdef ENABLE_MOON_LIGHT
+    scattering += GetAtmosphere(ro, rd, cloudDepth, light2.direction, light2.radiance);
+    al += GetAtmosphere(cloudPos, vec3(0, 1, 0), INFINITY, light2.direction, light2.radiance);
+#endif
+
+    clouds.x *= sqrt(atmosphereOcclusion);
+    float costh = dot(rd, light1.direction);
+    vec3 cloudColor = (GetLightTransmittance(cloudPos, light1.direction) * light1.radiance * clouds.x + al * clouds.y * 2.0) * cloudAlpha;
+    //cloudColor = vec3(0.0);
+#ifdef ENABLE_ATMOSPHERE
+    cloudColor = cloudColor * transmittance.xyz + scattering * cloudAlpha;
+#endif
+    return vec4(cloudColor, 1.0 - cloudAlpha);
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    vec4 mouse = iMouse / iResolution.xyxy;
+    float time = -iTime * 0.2 + 3.5;
+    vec2 sunPos = 0.5 + vec2(cos(time) * 0.4, sin(time) * 0.45);
+    if (iMouse.x > 10.0)
+    {
+        sunPos = mouse.xy;
+    }
+    
+    Light sun, moon;
+    
+    vec3 foo;
+    GetCamera(sunPos, iResolution, foo, sun.direction);
+    
+    vec2 moonPos = vec2(0.8, 0.7);
+    GetCamera(moonPos, iResolution, foo, moon.direction);
+    vec3 moonCenter = moon.direction * 384400e3;
+    const float moonRadius = 1737e3 * SUN_DISC_SIZE * 0.9; // Scale moon size with sun size
+    
+    sun.radiance = vec3(1.0);
+    moon.radiance = vec3(0.05) * (dot(sun.direction, -moon.direction) * 0.5 + 0.5);
+    
+    vec3 moonRadiance = vec3(0.05) * (dot(sun.direction, -moon.direction) * 0.5 + 0.5);
+    
+    float eclipse = smoothstep(1.0, 0.9999, dot(sun.direction, moon.direction));
+    eclipse = sqrt(eclipse);
+    sun.radiance *= mix(1.0, eclipse, 0.999);
+    
+    vec2 jitter = vec2(0.0);
+#ifdef CAM_TEMPORAL_AA
+    //jitter = hash21(iTime) - vec2(0.5);
+#endif
+    
+    vec2 uv = (fragCoord + jitter) / iResolution.xy;
+    vec2 uv0 = fragCoord / iResolution.xy;
+    
+    vec3 ro, rd;
+    GetCamera(uv, iResolution, ro, rd);
+    
+    float rl = INFINITY;
+    
+    vec3 color = vec3(0.0);
+    
+    vec4 occlusionTex = texture(iChannel1, uv);
+    float atmosphereOcclusion = occlusionTex.x;
+    float shadow = occlusionTex.y;
+    float shadow2 = occlusionTex.z;
+    float ambientOcclusion = pow8(occlusionTex.w);
+    
+    float temporalWeight = 0.0;
+    
+#ifdef ENABLE_TERRAIN
+    vec4 terrain = GetTerrain(uv, ro, rd, sun, moon);
+    if (terrain.x > 0.0)
+    {
+        rl = terrain.x;
+        color = terrain.yzw;
+    }
+#endif
+    
+#ifdef ENABLE_WATER
+    float water = SphereIntersection(ro, rd, PLANET_CENTER, PLANET_RADIUS + WATER_HEIGHT).x;
+    #ifdef ENABLE_TERRAIN
+    if (water > 0.0 && water < terrain.x)
+    #else
+    if (water > 0.0)
+    #endif
+    {
+        vec3 wp = ro + rd * water;
+        
+        vec3 wnd = vec3(0.0);
+        vec2 pf = wp.xz * 0.05;
+        float na = 0.5;
+        for (int i = 0; i < 2; i++)
+        {
+            vec3 nl = Noised(pf - vec2(iTime));
+            wnd.xz += nl.yz * na;
+            na *= 0.85;
+            pf = m*pf*2.0;
+        }
+        
+        vec3 wn = normalize(vec3(wnd.y, 10.0, wnd.z));
+        vec3 r = reflect(rd, wn);
+        float fresnel = pow(1.0 - clamp(dot(rd, -wn), 0.0, 1.0), 2.0);
+        float f = (0.05 + fresnel * 0.95) / PI;
+        
+        vec3 refl = vec3(0.0);
+        float wrl = INFINITY;
+        float reflOcclusion = 1.0;
+        float atmosphereOcclusion = 1.0;
+    #ifdef ENABLE_TERRAIN
+        vec4 reflTerrain = vec4(-1,0,0,0);
+        float wt = 0.0;
+        for (float i = 0.0; i < 64.0; i++)
+        {
+            vec3 localP = wp + r * wt;
+            vec3 dir = localP - ro;
+            float dist = length(dir);
+            dir /= dist;
+            vec2 localUV = GetUV(dir, iResolution);
+            vec4 localTerrain = texture(iChannel0, localUV);
+            if (localTerrain.x > 0.0 && dist > localTerrain.x)
+            {
+                reflTerrain = GetTerrain(localUV, wp, r, sun, moon);
+                reflOcclusion = 0.0;
+                atmosphereOcclusion = texture(iChannel1, localUV).x;
+                break;
+            }
+            if (localTerrain.x < 0.0)
+            {
+                break;
+            }
+            wt += localTerrain.x * 0.05;
+        }
+        
+        if (reflTerrain.x > 0.0)
+        {
+            wrl = reflTerrain.x;
+            refl = reflTerrain.yzw;
+        }
+    #endif
+        
+        vec4 wtransmittance = vec4(1.0);
+    #ifdef ENABLE_ATMOSPHERE
+        vec3 wscattering = GetAtmosphere(wp, r, wrl, sun.direction, sun.radiance, wtransmittance, vec4(0.0), atmosphereOcclusion);
+        refl = refl * wtransmittance.xyz + wscattering;
+    #endif
+        refl += GetSunDisc(r, sun.direction) * 1e1 * sun.radiance * wtransmittance.xyz * reflOcclusion;
+        
+        if (r.y > 0.0)
+        {
+            vec3 cloudPos = wp + r * CLOUD_PLANE_BOT / r.y;
+            vec2 cloudUV = GetUV(normalize(cloudPos - ro), iResolution);
+            vec4 wclouds = texture(iChannel2, cloudUV);
+            atmosphereOcclusion = texture(iChannel1, cloudUV).x;
+            wclouds = ResolveClouds(wclouds, wp, r, sun, moon, atmosphereOcclusion * reflOcclusion);
+            refl = refl * wclouds.a + wclouds.rgb;
+        }
+        
+        vec3 wc = refl * f;
+        
+        float waterWeight = 1.0;
+    #ifdef ENABLE_TERRAIN
+        waterWeight = 1.0 - exp(-(terrain.x - water) * 0.01);
+    #endif
+        
+        color = mix(color, wc, waterWeight);
+        rl = water;
+        
+        temporalWeight = 0.95;
+    }
+#endif
+    
+    // Get atmosphere (sun)
+    vec4 transmittance;
+    float altitude = max(0.0, (ro + rd * rl).y);
+    float fogWeight = GetFogWeight(ro, rd, rl, altitude);
+
+    vec3 scattering = GetAtmosphere(ro, rd, rl, sun.direction, sun.radiance, transmittance, vec4(HEIGHT_FOG_COLOR, fogWeight), atmosphereOcclusion);
+    
+#ifdef ENABLE_TERRAIN
+    transmittance.w *= terrain.x < 0.0 ? 1.0 : 0.0;
+#endif
+
+#ifdef ENABLE_STARS
+    // Stars
+    vec2 starCellF = fragCoord / 4.0;
+    uvec2 starCell = uvec2(floor(starCellF));
+    starCellF = fract(starCellF);
+    vec3 starHash = hash32(vec2(starCell));
+    vec3 stars = smoothstep(0.1, 0.0, length(starCellF - starHash.xy)) * vec3(pow(starHash.z, 10.0)) * 5e-3;
+    color += stars * transmittance.w;
+#endif
+   
+#ifdef ENABLE_CELESTIAL_BODIES
+    // Sun celestial body
+    color += GetSunDisc(rd, sun.direction) * 1e1 * sun.radiance * transmittance.w;
+    
+    // Moon celestial body
+    vec2 moonT = SphereIntersection(ro, rd, moonCenter, moonRadius);
+    if (moonT.x > 0.0)
+    {
+        vec3 moonNormal = normalize(ro + rd * moonT.x - moonCenter);
+        color = clamp(dot(moonNormal, sun.direction), 0.0, 1.0) * 0.14 * sun.radiance / PI;
+    }
+#endif
+    
+#ifdef ENABLE_ATMOSPHERE
+    // Apply atmosphere (sun)
+    color = color * transmittance.xyz + scattering;
+    #ifdef ENABLE_MOON_LIGHT
+    // Apply atmosphere (moon)
+    color += GetAtmosphere(ro, rd, rl, moon.direction, moon.radiance);
+    #endif
+#endif
+
+#ifdef ENABLE_CLOUDS
+    vec4 clouds = texture(iChannel2, uv);
+    clouds = ResolveClouds(clouds, ro, rd, sun, moon, atmosphereOcclusion);
+    color = color * clouds.a + clouds.rgb;
+#endif
+
+#ifdef CAM_AUTO_EXPOSURE
+    // Auto-exposure
+    vec3 radiance = GetAtmosphere(ro, vec3(0, 1, 0), INFINITY, sun.direction, sun.radiance) +
+        GetAtmosphere(ro, vec3(0, 1, 0), INFINITY, moon.direction, moon.radiance);
+    float lum = dot(radiance, vec3(0.3, 0.59, 0.11));
+    color *= min(CAM_AUTO_EXPOSURE_EV_LIMIT, 0.003 / clamp(lum, 0.0002, 1.0));
+#endif
+
+#ifdef CAM_EXPOSURE
+    color *= CAM_EXPOSURE;
+#endif
+
+#ifdef CAM_TONEMAP
+    color = TonemapACES(color);
+#endif
+
+#ifdef CAM_GAMMA
+    color = pow(color, vec3(1.0 / CAM_GAMMA));
+#endif
+   
+
+#ifdef DEBUG_SHADOWS
+    color = vec3(shadow);
+#endif
+
+#ifdef DEBUG_AMBIENT_OCCLUSION
+    color = vec3(ambientOcclusion);
+#endif
+
+#ifdef DEBUG_ATMOSPHERE_OCCLUSION
+    color = vec3(atmosphereOcclusion);
+#endif
+
+    vec4 prev = texture(iChannel3, uv0);
+    color = mix(color, prev.xyz, iMouse.z > 0.0 || iFrame < 1 ? 0.0 : temporalWeight);
+    
+    fragColor = vec4(color, 1.0);
+}
