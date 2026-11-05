@@ -1,0 +1,70 @@
+// Fast Atmosphere - screen-space atmospheric light visibility mask
+//
+// Implements the terrain-occlusion part of the source Shadertoy Buffer B in a
+// depth-only, screen-space form. It does not raymarch terrain or cast a 3D
+// shadow. For each pixel it samples the image-space segment from that pixel
+// toward the screen-space Sun position. Empty/background samples count as
+// visible sky; positive depth samples count as foreground occluders.
+//
+// Input 0: depth in R. Expected convention: positive = visible surface,
+//          values <= Depth Threshold = background/sky.
+// Output: grayscale visibility mask in RGB, alpha 1.0.
+//          1 = unoccluded screen-space path; 0 = fully blocked path.
+//
+// Use this mask as input 2 of FastAtmospherePostProcess_ScreenSpaceVisibility.
+
+kernel ScreenSpaceVisibility : ImageComputationKernel<ePixelWise>
+{
+    Image<eRead, eAccessRandom, eEdgeClamped> depth;
+    Image<eWrite, eAccessPoint> dst;
+
+    param:
+        float2 sunPositionPixels;
+        int raySamples;
+        float depthThreshold;
+
+    void define()
+    {
+        defineParam(sunPositionPixels, "Sun Position (Pixels)", float2(960.0f, 810.0f));
+        defineParam(raySamples, "Ray Samples", 8);
+        defineParam(depthThreshold, "Depth Threshold", 0.0f);
+    }
+
+    void process(int2 pos)
+    {
+        int width = depth.bounds.width();
+        int height = depth.bounds.height();
+        int samples = raySamples;
+        if (samples < 1) samples = 1;
+        // Keep a high diagnostic ceiling, but note that random depth reads are costly.
+        if (samples > 256) samples = 256;
+
+        // Pixel-space coordinates are relative to the image bounds. Pixel
+        // centers are offset by 0.5; Sun Position uses the agreed 0..width,
+        // 0..height convention, with the origin at bottom-left.
+        float px = (float)(pos.x - depth.bounds.x1) + 0.5f;
+        float py = (float)(pos.y - depth.bounds.y1) + 0.5f;
+        float dx = sunPositionPixels.x - px;
+        float dy = sunPositionPixels.y - py;
+
+        float visibleSamples = 0.0f;
+        for (int i = 0; i < samples; ++i)
+        {
+            // Midpoint sampling is deterministic and avoids sampling the
+            // current pixel or the exact Sun endpoint.
+            float t = ((float)i + 0.5f) / (float)samples;
+            int sxLocal = (int)floor(px + dx * t);
+            int syLocal = (int)floor(py + dy * t);
+            sxLocal = clamp(sxLocal, 0, width - 1);
+            syLocal = clamp(syLocal, 0, height - 1);
+
+            float sampledDepth = depth(depth.bounds.x1 + sxLocal,
+                                       depth.bounds.y1 + syLocal, 0);
+            if (sampledDepth <= depthThreshold)
+                visibleSamples += 1.0f;
+        }
+
+        float visibility = visibleSamples / (float)samples;
+        dst() = float4(visibility, visibility, visibility, 1.0f);
+    }
+};
