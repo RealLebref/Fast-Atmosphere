@@ -1,0 +1,369 @@
+// Fast Atmosphere - standalone atmosphere post-process
+// Derived from Fast-Atmosphere/Shadertoy Common and Buffer D by Felix Westin.
+// Applies camera-path transmittance + in-scattering to an existing scene-linear
+// beauty using a depth pass. It does not raymarch or shade geometry.
+// Input 0: beauty RGBA. Input 1: depth in R (ray distance by default).
+// Input 2: optional screen-space visibility mask (R); use Screen-Space Visibility
+//          to enable its effect on atmospheric in-scattering only.
+// All physical distances inside the atmosphere model are in metres. Depth Unit
+// Mode converts the incoming depth value to metres before applying atmosphere.
+// This initial version follows a fixed pinhole camera convention:
+// camera at (0, Camera Height, 0), +Z forward, Y up.
+
+kernel fastAtmosphere : ImageComputationKernel<ePixelWise>
+{
+    Image<eRead, eAccessPoint> beauty;
+    Image<eRead, eAccessPoint> depth;
+    Image<eRead, eAccessPoint> screenSpaceVisibility;
+    Image<eWrite, eAccessPoint> dst;
+
+    param:
+        bool enableViewAtmosphere;
+        bool renderSkyBackground;
+        bool enableSunDisk;
+        float2 sunScreenPositionPixels;
+        float4 sunRadiance;
+        float cameraHeight;
+        float cameraZ;
+        float planetRadius;
+        float atmosphereHeight;
+        float atmosphereDensity;
+        float aerialScale;
+        float sunDiskScale;
+        int depthUnitMode;
+        bool depthIsCameraZ;
+        bool outputAerialPerspectiveOnly;
+        bool useScreenSpaceVisibility;
+        float atmosphereRadianceScale;
+        float sunDiskIntensity;
+
+    void define()
+    {
+        defineParam(enableViewAtmosphere, "Enable View Atmosphere", true);
+        defineParam(renderSkyBackground, "Render Sky on Depth Misses", true);
+        defineParam(enableSunDisk, "Enable Sun Disk", true);
+        defineParam(sunScreenPositionPixels, "Sun Position (Pixels)", float2(960.0f, 810.0f));
+        defineParam(sunRadiance, "Sun Radiance", float4(1.0f, 1.0f, 1.0f, 1.0f));
+        defineParam(cameraHeight, "Camera Height (m)", 1800.0f);
+        defineParam(cameraZ, "Camera Projection Z", 1.4f);
+        defineParam(planetRadius, "Planet Radius (m)", 6371000.0f);
+        defineParam(atmosphereHeight, "Atmosphere Height (m)", 100000.0f);
+        defineParam(atmosphereDensity, "Atmosphere Density", 1.0f);
+        defineParam(aerialScale, "Aerial Perspective Scale", 3.0f);
+        defineParam(sunDiskScale, "Sun Disk Scale", 1.0f);
+        // 0=metres, 1=decimetres, 2=centimetres, 3=millimetres,
+        // 4=kilometres, 5=feet, 6=inches, 7=yards, 8=miles.
+        // Use the companion Group-level Enumeration knob helper for a menu.
+        defineParam(depthUnitMode, "Depth Unit Mode", 0);
+        defineParam(depthIsCameraZ, "Depth Is Camera-Space Z", false);
+        defineParam(outputAerialPerspectiveOnly, "Output Aerial Perspective Only", false); // RGB=airlight, A=1-luminance(T) for Merge (over).
+        defineParam(useScreenSpaceVisibility, "Use Screen-Space Visibility", false);
+        // A scale of 10 preserves the previous prototype's Linear Exposure=10
+        // for the atmospheric radiance added to its already-exposed CG beauty.
+        defineParam(atmosphereRadianceScale, "Atmosphere Radiance Scale", 10.0f);
+        // Previously the disk intensity (10) was multiplied by exposure (10).
+        defineParam(sunDiskIntensity, "Sun Disk Intensity", 100.0f);
+    }
+
+    float sq(float x) { return x * x; }
+    float pow4(float x) { return sq(x) * sq(x); }
+    float pow8(float x) { return pow4(x) * pow4(x); }
+    float saturate1(float x) { return clamp(x, 0.0f, 1.0f); }
+
+    float smooth01(float a, float b, float x)
+    {
+        float t = clamp((x - a) / (b - a), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    float2 sphereIntersection(float3 rayStart, float3 rayDir,
+                              float3 sphereCenter, float sphereRadius)
+    {
+        float3 oc = rayStart - sphereCenter;
+        float b = oc.x * rayDir.x + oc.y * rayDir.y + oc.z * rayDir.z;
+        float c = oc.x * oc.x + oc.y * oc.y + oc.z * oc.z
+                - sphereRadius * sphereRadius;
+        float h = b * b - c;
+        if (h < 0.0f)
+            return float2(-1.0f, -1.0f);
+        h = sqrt(h);
+        return float2(-b - h, -b + h);
+    }
+
+    float3 lightTransmittance(float3 position, float3 lightDir,
+                              float multiplier, float ozoneMultiplier)
+    {
+        float lightExtinctionAmount = exp(-(saturate1(lightDir.y + 0.05f) * 40.0f))
+            + exp(-(saturate1(lightDir.y + 0.5f) * 5.0f)) * 0.4f
+            + sq(saturate1(1.0f - lightDir.y)) * 0.02f
+            + 0.002f;
+
+        float rx = (5.802f + 3.996f + 0.650f * ozoneMultiplier) * 1.0e-6f;
+        float gy = (13.558f + 3.996f + 1.881f * ozoneMultiplier) * 1.0e-6f;
+        float bz = (33.100f + 3.996f + 0.085f * ozoneMultiplier) * 1.0e-6f;
+        float scale = lightExtinctionAmount * atmosphereDensity * multiplier * 1.0e6f;
+        return float3(exp(-rx * scale), exp(-gy * scale), exp(-bz * scale));
+    }
+
+    float phaseRayleigh(float costh)
+    {
+        return (1.0f + sq(costh)) * 0.06f;
+    }
+
+    float phaseMie(float costh, float g)
+    {
+        g = min(g, 0.9381f);
+        float k = 1.55f * g - 0.55f * sq(g) * g;
+        float a = 1.0f - sq(k);
+        float b = 12.57f * sq(1.0f - k * costh);
+        return a / b;
+    }
+
+    // Convert the incoming depth channel to metres. Index order must match the
+    // Depth Units menu created by add_depth_units_menu.py.
+    float depthToMeters(float depthValue)
+    {
+        if (depthUnitMode == 0) return depthValue;                  // metres
+        if (depthUnitMode == 1) return depthValue * 0.1f;           // decimetres
+        if (depthUnitMode == 2) return depthValue * 0.01f;          // centimetres
+        if (depthUnitMode == 3) return depthValue * 0.001f;         // millimetres
+        if (depthUnitMode == 4) return depthValue * 1000.0f;        // kilometres
+        if (depthUnitMode == 5) return depthValue * 0.3048f;        // feet
+        if (depthUnitMode == 6) return depthValue * 0.0254f;        // inches
+        if (depthUnitMode == 7) return depthValue * 0.9144f;        // yards
+        if (depthUnitMode == 8) return depthValue * 1609.344f;      // miles
+        return depthValue; // Safe fallback to metres.
+    }
+
+    // Normal mode returns baseColor * transmittance + in-scattered radiance.
+    // Aerial-only mode returns the in-scattered radiance as premultiplied RGB and
+    // a useful scalar compositing alpha: 1 - luminance(transmittance). This makes
+    // the pass useful with Merge (over), although scalar alpha cannot reproduce
+    // the full per-channel RGB transmittance exactly.
+    float4 applyViewAtmosphere(float3 baseColor, float3 rayStart, float3 rayDir,
+                               float rayLength, float3 lightDir, float3 lightColor,
+                               float scatteringVisibility, bool aerialOnly)
+    {
+        rayStart.y = max(rayStart.y, 1.0f);
+        float3 planetCenter = float3(0.0f, -planetRadius, 0.0f);
+        float2 planetT = sphereIntersection(rayStart, rayDir, planetCenter, planetRadius);
+        float2 atmosphereT = sphereIntersection(rayStart, rayDir,
+                                                planetCenter, planetRadius + atmosphereHeight);
+        if (atmosphereT.y < 0.0f)
+        {
+            if (aerialOnly)
+                return float4(0.0f, 0.0f, 0.0f, 0.0f);
+            return float4(baseColor.x, baseColor.y, baseColor.z, 1.0f);
+        }
+
+        atmosphereT.y -= max(0.0f, atmosphereT.x);
+        float opticalDepth = planetT.x > 0.0f
+            ? min(planetT.x, atmosphereT.y)
+            : atmosphereT.y;
+        opticalDepth = min(rayLength, opticalDepth);
+        opticalDepth = min(opticalDepth * 2.5f * aerialScale, atmosphereT.y);
+        opticalDepth = max(opticalDepth, 0.0f);
+
+        float normAltitude = rayStart.y / atmosphereHeight;
+        float hbias = 1.0f - 1.0f / (2.0f + sq(atmosphereT.y) * 1.0e-12f);
+        hbias = pow(hbias, 1.0f + normAltitude * 10.0f);
+        float sqhbias = sq(hbias);
+        float densityR = sqhbias * atmosphereDensity;
+        float densityM = sq(sqhbias) * hbias * atmosphereDensity;
+
+        float ly = lightDir.y;
+        ly += saturate1(-lightDir.y + 0.02f) * saturate1(lightDir.y + 0.7f);
+        ly = clamp(ly, -1.0f, 1.0f);
+        float3 attenuatedLight = float3(lightColor.x, lightColor.y, lightColor.z)
+            * lightTransmittance(rayStart, float3(lightDir.x, ly, lightDir.z), hbias, 5.0f);
+
+        float3 rayleighCoeff = float3(5.802e-6f, 13.558e-6f, 33.100e-6f);
+        float3 mieCoeff = float3(3.996e-6f, 3.996e-6f, 3.996e-6f);
+        float3 ozoneCoeff = float3(0.650e-6f, 1.881e-6f, 0.085e-6f);
+
+        float3 R = float3(
+            (1.0f - exp(-opticalDepth * densityR * rayleighCoeff.x / 2.5f)) * 2.5f,
+            (1.0f - exp(-opticalDepth * densityR * rayleighCoeff.y / 2.5f)) * 2.5f,
+            (1.0f - exp(-opticalDepth * densityR * rayleighCoeff.z / 2.5f)) * 2.5f);
+        float3 M = float3(
+            (1.0f - exp(-opticalDepth * densityM * mieCoeff.x / 0.5f)) * 0.5f,
+            (1.0f - exp(-opticalDepth * densityM * mieCoeff.y / 0.5f)) * 0.5f,
+            (1.0f - exp(-opticalDepth * densityM * mieCoeff.z / 0.5f)) * 0.5f);
+
+        float3 E = float3(
+            rayleighCoeff.x * densityR + mieCoeff.x * densityM + ozoneCoeff.x * densityR * 1.5f,
+            rayleighCoeff.y * densityR + mieCoeff.y * densityM + ozoneCoeff.y * densityR * 1.5f,
+            rayleighCoeff.z * densityR + mieCoeff.z * densityM + ozoneCoeff.z * densityR * 1.5f)
+            * pow4(1.0f - normAltitude) * 0.25f;
+
+        float costh = rayDir.x * lightDir.x + rayDir.y * lightDir.y + rayDir.z * lightDir.z;
+        float phaseR = phaseRayleigh(costh);
+        float phaseM = phaseMie(costh, 0.88f);
+        const float nightLight = 2.0e-3f;
+
+        float3 rayleigh = float3(
+            (phaseR * 1.0f + phaseR * 0.3f) * attenuatedLight.x + nightLight * phaseR,
+            (phaseR * 1.0f + phaseR * 0.3f) * attenuatedLight.y + nightLight * phaseR,
+            (phaseR * 1.0f + phaseR * 0.3f) * attenuatedLight.z + nightLight * phaseR);
+        float3 mie = float3(
+            ((phaseM * 1.0f + phaseR * 0.3f) * attenuatedLight.x + nightLight * phaseR) * 0.95f,
+            ((phaseM * 1.0f + phaseR * 0.3f) * attenuatedLight.y + nightLight * phaseR) * 0.85f,
+            ((phaseM * 1.0f + phaseR * 0.3f) * attenuatedLight.z + nightLight * phaseR) * 0.75f);
+
+        float3 scattering = float3(
+            mie.x * M.x + rayleigh.x * R.x,
+            mie.y * M.y + rayleigh.y * R.y,
+            mie.z * M.z + rayleigh.z * R.z) * 0.23f;
+
+        float d = opticalDepth + pow8(opticalDepth * 4.5e-6f);
+        float3 transmittance = float3(exp(-d * E.x), exp(-d * E.y), exp(-d * E.z));
+        float3 airlight = scattering * atmosphereRadianceScale
+                        * clamp(scatteringVisibility, 0.0f, 1.0f);
+        if (aerialOnly)
+        {
+            // A scalar alpha cannot represent RGB transmittance exactly. Use
+            // linear Rec.709 luminance as a practical artist-friendly opacity.
+            float transmittanceLuma = transmittance.x * 0.2126f
+                                    + transmittance.y * 0.7152f
+                                    + transmittance.z * 0.0722f;
+            float aerialAlpha = saturate1(1.0f - transmittanceLuma);
+            // RGB is intentionally the premultiplied in-scattering term, so
+            // Merge (over) adds airlight and attenuates the beauty by 1-alpha.
+            return float4(airlight.x, airlight.y, airlight.z, aerialAlpha);
+        }
+        return float4(
+            baseColor.x * transmittance.x + airlight.x,
+            baseColor.y * transmittance.y + airlight.y,
+            baseColor.z * transmittance.z + airlight.z,
+            1.0f);
+    }
+
+    float sunDisk(float3 rayDir, float3 lightDir)
+    {
+        float threshold = cos(0.00436f * sunDiskScale);
+        float costh = rayDir.x * lightDir.x + rayDir.y * lightDir.y + rayDir.z * lightDir.z;
+        return sqrt(smooth01(threshold, 1.0f, costh));
+    }
+
+    float planetVisibleAlongRay(float3 rayStart, float3 rayDir)
+    {
+        float3 planetCenter = float3(0.0f, -planetRadius, 0.0f);
+        float2 planetT = sphereIntersection(rayStart, rayDir, planetCenter, planetRadius);
+        return planetT.x <= 0.0f ? 1.0f : 0.0f;
+    }
+
+    void process(int2 pos)
+    {
+        float4 src = beauty();
+        float4 depthPixel = depth();
+        float tInput = depthPixel.x;
+
+        float width = (float)dst.bounds.width();
+        float height = (float)dst.bounds.height();
+        float2 uv = float2(
+            ((float)(pos.x - dst.bounds.x1) + 0.5f) / width,
+            ((float)(pos.y - dst.bounds.y1) + 0.5f) / height);
+        float aspect = width / height;
+
+        // The sun knob is in output-image pixels, bottom-left origin, then converted to UV.
+        float2 sunUV = float2(sunScreenPositionPixels.x / width,
+                              sunScreenPositionPixels.y / height);
+        float3 sunDir = normalize(float3((sunUV.x - 0.5f) * aspect,
+                                         sunUV.y - 0.5f,
+                                         cameraZ));
+        float3 sunRgb = float3(sunRadiance.x, sunRadiance.y, sunRadiance.z);
+        float scatteringVisibility = 1.0f;
+        if (useScreenSpaceVisibility)
+            scatteringVisibility = clamp(screenSpaceVisibility().x, 0.0f, 1.0f);
+
+        float3 ro = float3(0.0f, cameraHeight, 0.0f);
+        float3 rd = normalize(float3((uv.x - 0.5f) * aspect,
+                                     uv.y - 0.5f,
+                                     cameraZ));
+
+        if (tInput > 0.0f)
+        {
+            float depthMeters = depthToMeters(tInput);
+            float rayLength = depthMeters;
+            if (depthIsCameraZ)
+                rayLength = depthMeters / max(rd.z, 1.0e-4f);
+
+            float3 color = float3(src.x, src.y, src.z);
+            if (outputAerialPerspectiveOnly)
+            {
+                if (enableViewAtmosphere)
+                {
+                    float4 aerial = applyViewAtmosphere(color, ro, rd, rayLength, sunDir, sunRgb,
+                                                        scatteringVisibility, true);
+                    dst() = float4(aerial.x, aerial.y, aerial.z, aerial.w * scatteringVisibility);
+                }
+                else
+                    dst() = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                return;
+            }
+
+            if (enableViewAtmosphere)
+            {
+                float4 atmosphereResult = applyViewAtmosphere(color, ro, rd, rayLength,
+                                                              sunDir, sunRgb, scatteringVisibility, false);
+                color = float3(atmosphereResult.x, atmosphereResult.y, atmosphereResult.z);
+            }
+            dst() = float4(color.x, color.y, color.z, src.w);
+            return;
+        }
+
+        // Zero/negative depth means there is no surface. If sky generation is
+        // enabled, integrate to the atmosphere boundary rather than treating
+        // this as a zero-length path. It remains a separate post-process effect.
+        if (!renderSkyBackground)
+        {
+            if (outputAerialPerspectiveOnly)
+                dst() = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            else
+                dst() = src;
+            return;
+        }
+
+        // A camera ray that intersects the planet but has no depth hit is not a sky ray.
+        // Preserve the incoming pixel instead of painting atmosphere behind the planet.
+        if (planetVisibleAlongRay(ro, rd) <= 0.0f)
+        {
+            if (outputAerialPerspectiveOnly)
+                dst() = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            else
+                dst() = src;
+            return;
+        }
+
+        float3 skyBase = float3(0.0f, 0.0f, 0.0f);
+        // The isolated aerial-perspective pass intentionally excludes the direct
+        // sun disk; it contains atmospheric in-scattering only.
+        if (enableSunDisk && !outputAerialPerspectiveOnly)
+        {
+            float disk = sunDisk(rd, sunDir);
+            skyBase += sunRgb * (disk * sunDiskIntensity);
+        }
+
+        if (outputAerialPerspectiveOnly)
+        {
+            if (enableViewAtmosphere)
+            {
+                float4 aerial = applyViewAtmosphere(skyBase, ro, rd, 1.0e30f, sunDir, sunRgb,
+                                                    scatteringVisibility, true);
+                dst() = float4(aerial.x, aerial.y, aerial.z, aerial.w * scatteringVisibility);
+            }
+            else
+                dst() = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            return;
+        }
+
+        float3 skyColor = skyBase;
+        if (enableViewAtmosphere)
+        {
+            float4 atmosphereResult = applyViewAtmosphere(skyBase, ro, rd, 1.0e30f,
+                                                          sunDir, sunRgb, scatteringVisibility, false);
+            skyColor = float3(atmosphereResult.x, atmosphereResult.y, atmosphereResult.z);
+        }
+        dst() = float4(skyColor.x, skyColor.y, skyColor.z, 1.0f);
+    }
+};
