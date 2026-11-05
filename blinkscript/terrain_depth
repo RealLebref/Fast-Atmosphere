@@ -1,0 +1,17 @@
+// Fast Atmosphere - depth extraction from the terrain-data pass.
+// Copyright (c) 2024 Felix Westin (source shader); adapted under MIT. See LICENSE.txt.
+// R/G/B contain ray distance in metres. Negative distances mark misses.
+// Alpha is 1 for a positive hit and 0 otherwise. Shuffle rgba.red to depth.Z
+// when building a multilayer Nuke stream.
+
+kernel terrain_depth : ImageComputationKernel<ePixelWise>
+{
+    Image<eRead, eAccessPoint> terrainData;
+    Image<eWrite, eAccessPoint> dst;
+
+    void process()
+    {
+        float t = terrainData().x;
+        dst() = float4(t, t, t, (t > 0.0f) ? 1.0f : 0.0f);
+    }
+};
