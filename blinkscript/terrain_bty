@@ -1,0 +1,249 @@
+// Fast Atmosphere - procedural terrain CG beauty/shading pass
+// No camera-path aerial perspective, generated sky, or visible sun disk.
+// Those effects are applied by FastAtmospherePostProcess.blink.
+// Copyright (c) 2024 Felix Westin (source shader); adapted under MIT. See LICENSE.txt.
+// Derived from Fast-Atmosphere/shadertoy/Buffer D and Common by Felix Westin.
+// Consumes FastAtmosphereTerrainData; does not raymarch the terrain again.
+//
+// The source terrain albedo, direct-light equation, light transmittance,
+// atmosphere-lit ambient term, and fake bounce term are retained. Camera-path
+// aerial perspective, water, clouds, AO, temporal accumulation, ACES, gamma,
+// FXAA, and display dithering are intentionally omitted. Output is scene-linear.
+
+kernel terrain_bty : ImageComputationKernel<ePixelWise>
+{
+    Image<eRead, eAccessPoint> terrainData;
+    Image<eWrite, eAccessPoint> dst;
+
+    param:
+        float cameraHeight;
+        float cameraZ;
+        float2 sunScreenPositionPixels;
+        float4 sunRadiance;
+        float exposure;
+        float ambientStrength;
+        float planetRadius;
+        float atmosphereHeight;
+        float atmosphereDensity;
+
+    void define()
+    {
+        defineParam(cameraHeight, "Camera Height (m)", 1800.0f);
+        defineParam(cameraZ, "Camera Projection Z", 1.4f);
+        // Image-space pixel coordinates relative to the lower-left corner.
+        // Default matches UV=(0.5, 0.75) at 1920x1080.
+        defineParam(sunScreenPositionPixels, "Sun Position (Pixels)", float2(960.0f, 810.0f));
+        defineParam(sunRadiance, "Sun Radiance", float4(1.0f, 1.0f, 1.0f, 1.0f));
+        defineParam(exposure, "Linear Exposure", 10.0f);
+        defineParam(ambientStrength, "Atmospheric Ambient Strength", 1.0f);
+        defineParam(planetRadius, "Planet Radius (m)", 6371000.0f);
+        defineParam(atmosphereHeight, "Atmosphere Height (m)", 100000.0f);
+        defineParam(atmosphereDensity, "Atmosphere Density", 1.0f);
+    }
+
+    float sq(float x) { return x * x; }
+    float pow4(float x) { return sq(x) * sq(x); }
+    float pow8(float x) { return pow4(x) * pow4(x); }
+    float saturate1(float x) { return clamp(x, 0.0f, 1.0f); }
+
+    float smooth01(float a, float b, float x)
+    {
+        float t = clamp((x - a) / (b - a), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    float3 mix3(float3 a, float3 b, float t)
+    {
+        return a * (1.0f - t) + b * t;
+    }
+
+    float2 sphereIntersection(float3 rayStart, float3 rayDir,
+                              float3 sphereCenter, float sphereRadius)
+    {
+        float3 oc = rayStart - sphereCenter;
+        float b = oc.x * rayDir.x + oc.y * rayDir.y + oc.z * rayDir.z;
+        float c = oc.x * oc.x + oc.y * oc.y + oc.z * oc.z
+                - sphereRadius * sphereRadius;
+        float h = b * b - c;
+        if (h < 0.0f)
+            return float2(-1.0f, -1.0f);
+        h = sqrt(h);
+        return float2(-b - h, -b + h);
+    }
+
+    float3 lightTransmittance(float3 position, float3 lightDir,
+                              float multiplier, float ozoneMultiplier)
+    {
+        // Common::GetLightTransmittance. position is retained for parity even
+        // though the source approximation currently does not use it.
+        float lightExtinctionAmount = exp(-(saturate1(lightDir.y + 0.05f) * 40.0f))
+            + exp(-(saturate1(lightDir.y + 0.5f) * 5.0f)) * 0.4f
+            + sq(saturate1(1.0f - lightDir.y)) * 0.02f
+            + 0.002f;
+
+        float rx = (5.802f + 3.996f + 0.650f * ozoneMultiplier) * 1.0e-6f;
+        float gy = (13.558f + 3.996f + 1.881f * ozoneMultiplier) * 1.0e-6f;
+        float bz = (33.100f + 3.996f + 0.085f * ozoneMultiplier) * 1.0e-6f;
+        float scale = lightExtinctionAmount * atmosphereDensity * multiplier * 1.0e6f;
+
+        return float3(exp(-rx * scale), exp(-gy * scale), exp(-bz * scale));
+    }
+
+    float3 lightTransmittanceSimple(float3 position, float3 lightDir)
+    {
+        return lightTransmittance(position, lightDir, 1.0f, 1.0f);
+    }
+
+    float phaseRayleigh(float costh)
+    {
+        return (1.0f + sq(costh)) * 0.06f;
+    }
+
+    float phaseMie(float costh, float g)
+    {
+        g = min(g, 0.9381f);
+        float k = 1.55f * g - 0.55f * sq(g) * g;
+        float a = 1.0f - sq(k);
+        float b = 12.57f * sq(1.0f - k * costh);
+        return a / b;
+    }
+
+    float3 atmosphereAmbient(float3 rayStart, float3 rayDir,
+                             float3 lightDir, float3 lightColor)
+    {
+        // Port of Common::GetAtmosphere for Buffer D's ambient-light query.
+        // The original overload's transmittance output is not consumed here.
+        float3 planetCenter = float3(0.0f, -planetRadius, 0.0f);
+        float2 planetT = sphereIntersection(rayStart, rayDir, planetCenter, planetRadius);
+        float2 atmosphereT = sphereIntersection(rayStart, rayDir,
+                                                planetCenter, planetRadius + atmosphereHeight);
+        if (atmosphereT.y < 0.0f)
+            return float3(0.0f, 0.0f, 0.0f);
+
+        atmosphereT.y -= max(0.0f, atmosphereT.x);
+        float opticalDepth = planetT.x > 0.0f ? min(planetT.x, atmosphereT.y) : atmosphereT.y;
+        opticalDepth = min(opticalDepth * 2.5f * 3.0f, atmosphereT.y);
+
+        float normAltitude = rayStart.y / atmosphereHeight;
+        float hbias = 1.0f - 1.0f / (2.0f + sq(atmosphereT.y) * 1.0e-12f);
+        hbias = pow(hbias, 1.0f + normAltitude * 10.0f);
+        float sqhbias = sq(hbias);
+        float densityR = sqhbias * atmosphereDensity;
+        float densityM = sq(sqhbias) * hbias * atmosphereDensity;
+
+        float ly = lightDir.y;
+        ly += saturate1(-lightDir.y + 0.02f) * saturate1(lightDir.y + 0.7f);
+        ly = clamp(ly, -1.0f, 1.0f);
+        lightColor = float3(lightColor.x, lightColor.y, lightColor.z)
+                   * lightTransmittance(rayStart, float3(lightDir.x, ly, lightDir.z), hbias, 5.0f);
+
+        float3 rayleighCoeff = float3(5.802e-6f, 13.558e-6f, 33.100e-6f);
+        float3 mieCoeff = float3(3.996e-6f, 3.996e-6f, 3.996e-6f);
+        float3 ozoneCoeff = float3(0.650e-6f, 1.881e-6f, 0.085e-6f);
+
+        float3 R = float3(
+            (1.0f - exp(-opticalDepth * densityR * rayleighCoeff.x / 2.5f)) * 2.5f,
+            (1.0f - exp(-opticalDepth * densityR * rayleighCoeff.y / 2.5f)) * 2.5f,
+            (1.0f - exp(-opticalDepth * densityR * rayleighCoeff.z / 2.5f)) * 2.5f);
+        float3 M = float3(
+            (1.0f - exp(-opticalDepth * densityM * mieCoeff.x / 0.5f)) * 0.5f,
+            (1.0f - exp(-opticalDepth * densityM * mieCoeff.y / 0.5f)) * 0.5f,
+            (1.0f - exp(-opticalDepth * densityM * mieCoeff.z / 0.5f)) * 0.5f);
+
+        float3 E = float3(
+            (rayleighCoeff.x * densityR + mieCoeff.x * densityM + ozoneCoeff.x * densityR * 1.5f),
+            (rayleighCoeff.y * densityR + mieCoeff.y * densityM + ozoneCoeff.y * densityR * 1.5f),
+            (rayleighCoeff.z * densityR + mieCoeff.z * densityM + ozoneCoeff.z * densityR * 1.5f))
+            * pow4(1.0f - normAltitude) * 0.25f;
+
+        float costh = rayDir.x * lightDir.x + rayDir.y * lightDir.y + rayDir.z * lightDir.z;
+        float phaseR = phaseRayleigh(costh);
+        float phaseM = phaseMie(costh, 0.88f);
+        float nightLight = 2.0e-3f;
+
+        float3 rayleigh = lightColor * (phaseR * 1.0f + phaseR * 0.3f)
+                        + float3(nightLight * phaseR, nightLight * phaseR, nightLight * phaseR);
+        float3 mie = lightColor * (phaseM * 1.0f + phaseR * 0.3f);
+        mie = float3(mie.x * 0.95f + nightLight * phaseR * 0.95f,
+                     mie.y * 0.85f + nightLight * phaseR * 0.85f,
+                     mie.z * 0.75f + nightLight * phaseR * 0.75f);
+
+        float3 scattering = float3(
+            mie.x * M.x + rayleigh.x * R.x,
+            mie.y * M.y + rayleigh.y * R.y,
+            mie.z * M.z + rayleigh.z * R.z);
+        return scattering * 0.23f;
+    }
+
+    float3 expandPackedNormal(float2 packed)
+    {
+        float yy = sqrt(1.0f - clamp(packed.x * packed.x + packed.y * packed.y, 0.0f, 1.0f));
+        return float3(packed.x, yy, packed.y);
+    }
+
+    void process(int2 pos)
+    {
+        float4 data = terrainData();
+        float t = data.x;
+        if (t <= 0.0f)
+        {
+            dst() = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            return;
+        }
+
+        float width = (float)dst.bounds.width();
+        float height = (float)dst.bounds.height();
+        float2 uv = float2(
+            ((float)(pos.x - dst.bounds.x1) + 0.5f) / width,
+            ((float)(pos.y - dst.bounds.y1) + 0.5f) / height);
+        float aspect = width / height;
+
+        float3 ro = float3(0.0f, cameraHeight, 0.0f);
+        float3 rd = normalize(float3((uv.x - 0.5f) * aspect,
+                                     uv.y - 0.5f,
+                                     cameraZ));
+        float3 p = ro + rd * t;
+        float3 n = expandPackedNormal(float2(data.y, data.z));
+
+        // Buffer D's material model; water/beach blending is intentionally removed.
+        float3 cliffAlbedo = float3(0.2f, 0.2f, 0.2f);
+        float3 grassAlbedo = float3(0.1f, 0.17f, 0.05f);
+        float3 sandAlbedo = float3(0.4f, 0.3f, 0.2f);
+        float3 snowAlbedo = float3(0.8f, 0.8f, 0.8f);
+        float edge = 1.0f - data.w;
+
+        float3 cliff = mix3(cliffAlbedo, float3(0.4f, 0.4f, 0.4f), smooth01(0.0f, 0.08f, edge));
+        float3 grass = mix3(grassAlbedo, float3(0.5f, 0.4f, 0.3f), smooth01(0.02f, 0.1f, edge));
+        float3 albedo = mix3(cliff, grass, smooth01(0.9f, 0.95f, n.y));
+        float snowWeight = smooth01(0.8f, 0.81f, n.y) * smooth01(900.0f, 1300.0f, p.y);
+        albedo = mix3(albedo, snowAlbedo, snowWeight);
+
+        float2 sunScreenPositionUV = float2(
+            sunScreenPositionPixels.x / width,
+            sunScreenPositionPixels.y / height);
+        float3 sunDir = normalize(float3((sunScreenPositionUV.x - 0.5f) * aspect,
+                                         sunScreenPositionUV.y - 0.5f,
+                                         cameraZ));
+        float3 sunRgb = float3(sunRadiance.x, sunRadiance.y, sunRadiance.z);
+        float3 sunTransmittance = lightTransmittanceSimple(p, sunDir);
+        float ndotl = max(0.0f, min(1.0f, n.x * sunDir.x + n.y * sunDir.y + n.z * sunDir.z));
+        float3 color = albedo * ndotl * (1.0f / 3.14159265359f)
+                     * sunRgb * sunTransmittance;
+
+        // Buffer D's atmosphere-lit ambient term and its inexpensive fake bounce.
+        float3 ambientDir = normalize(float3(0.0f, 1.0f, 0.0f) + n * 4.0f);
+        float3 ambient = atmosphereAmbient(p, ambientDir, sunDir, sunRgb) * ambientStrength;
+        float3 bounceAlbedo = (cliffAlbedo + grassAlbedo + sandAlbedo + snowAlbedo) * 0.25f;
+        ambient += float3(
+            sunRgb.x * sunTransmittance.x,
+            sunRgb.y * sunTransmittance.y,
+            sunRgb.z * sunTransmittance.z)
+            * (1.0f - n.y * 0.75f) * bounceAlbedo * 0.05f;
+        color += albedo * ambient * 2.0f;
+
+        // Retain a scene-linear beauty. The original Shadertoy's exposure,
+        // auto-exposure, ACES, gamma, FXAA, and dither are display-stage effects.
+        color *= exposure;
+        dst() = float4(color.x, color.y, color.z, 1.0f);
+    }
+};
