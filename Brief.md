@@ -8,7 +8,7 @@
 
 ## 1. Project goal
 
-Convert the working GLSL rendering code in the GitHub project [RealLebref/Fast-Atmosphere](https://github.com/RealLebref/Fast-Atmosphere), especially its `shadertoy` folder, into Foundry Nuke BlinkScript kernels.
+Convert the working GLSL rendering code in the GitHub project [RealLebref/Fast-Atmosphere](https://github.com/RealLebref/Fast-Atmosphere), especially its `shadertoy` folder (https://www.shadertoy.com/view/lcfSRl), into Foundry Nuke BlinkScript kernels.
 
 The long-term goal is a reusable **Nuke Atmosphere gizmo** that applies atmospheric scattering and aerial perspective as a post-processing effect to an external renderer's CG render. The render may provide an RGBA beauty and AOVs such as depth, world position, and normal.
 
