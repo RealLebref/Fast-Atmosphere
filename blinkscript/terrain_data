@@ -1,0 +1,253 @@
+// Fast Atmosphere - procedural terrain data pass
+// Copyright (c) 2024 Felix Westin (source shader); adapted under MIT. See LICENSE.txt.
+// Ported from Fast-Atmosphere/shadertoy/Buffer A and Common by Felix Westin.
+// This pass deliberately preserves the source shader's data layout:
+//   R = ray distance in metres (negative means no hit)
+//   G = terrain normal X
+//   B = terrain normal Z
+//   A = terrain-detail / normal-coherence value used by Buffer D's material shader
+//
+// The Shadertoy frame cache and metadata pixel are intentionally omitted.
+
+kernel terrainData : ImageComputationKernel<ePixelWise>
+{
+    // Connect a Constant/Reformat only to define the output format. Its pixel
+    // values are not used. The image lets this generator inherit Nuke's format.
+    Image<eRead, eAccessPoint> formatSource;
+    Image<eWrite, eAccessPoint> dst;
+
+    param:
+        float cameraHeight;
+        float cameraZ;
+        float terrainHeightAmount;
+        float terrainCenter;
+        float terrainScale;
+        float2 terrainOffset;
+        int terrainOctaves;
+        float terrainGain;
+        float terrainLacunarity;
+        float maxDistance;
+        int maxMarchSteps;
+        float planetRadius;
+        float curvatureStep;
+        bool intersectPlanetFallback;
+        bool computeTerrainDetail;
+
+    void define()
+    {
+        defineParam(cameraHeight, "Camera Height (m)", 1800.0f);
+        defineParam(cameraZ, "Camera Projection Z", 1.4f);
+        defineParam(terrainHeightAmount, "Terrain Height", 3000.0f);
+        defineParam(terrainCenter, "Terrain Center", 0.3f);
+        defineParam(terrainScale, "Terrain Scale", 4000.0f);
+        defineParam(terrainOffset, "Terrain Offset", float2(0.0f, 20.0f));
+        defineParam(terrainOctaves, "Terrain Octaves", 12);
+        defineParam(terrainGain, "Terrain Gain", 0.45f);
+        defineParam(terrainLacunarity, "Terrain Lacunarity", 2.0f);
+        defineParam(maxDistance, "Maximum Distance (m)", 200000.0f);
+        defineParam(maxMarchSteps, "Maximum March Steps", 512);
+        defineParam(planetRadius, "Planet Radius (m)", 6371000.0f);
+        defineParam(curvatureStep, "Detail Probe Distance (m)", 100.0f);
+        defineParam(intersectPlanetFallback, "Use Planet Horizon Fallback", true);
+        defineParam(computeTerrainDetail, "Compute Terrain Detail (slower)", true);
+    }
+
+    float fract1(float x)
+    {
+        return x - floor(x);
+    }
+
+    float2 fract2(float2 v)
+    {
+        return float2(fract1(v.x), fract1(v.y));
+    }
+
+    float3 fract3(float3 v)
+    {
+        return float3(fract1(v.x), fract1(v.y), fract1(v.z));
+    }
+
+    float hash12(float2 p)
+    {
+        // Matches Common::hash12 in the original shader.
+        float3 p3 = fract3(float3(p.x, p.y, p.x) * 0.1031f);
+        float h = p3.x * (p3.y + 33.33f)
+                + p3.y * (p3.z + 33.33f)
+                + p3.z * (p3.x + 33.33f);
+        p3 += h;
+        return fract1((p3.x + p3.y) * p3.z);
+    }
+
+    float3 noised(float2 x)
+    {
+        // Inigo Quilez's value-noise-with-derivatives implementation,
+        // matching Common::Noised.
+        float2 p = float2(floor(x.x), floor(x.y));
+        float2 f = fract2(x);
+        float2 u = f * f * (float2(3.0f, 3.0f) - 2.0f * f);
+
+        float a = hash12(p + float2(0.0f, 0.0f));
+        float b = hash12(p + float2(1.0f, 0.0f));
+        float c = hash12(p + float2(0.0f, 1.0f));
+        float d = hash12(p + float2(1.0f, 1.0f));
+        float k = a - b - c + d;
+
+        float value = a + (b - a) * u.x + (c - a) * u.y + k * u.x * u.y;
+        float dx = 6.0f * f.x * (1.0f - f.x) * ((b - a) + k * u.y);
+        float dy = 6.0f * f.y * (1.0f - f.y) * ((c - a) + k * u.x);
+        return float3(value, dx, dy);
+    }
+
+    float2 rotateTerrainDomain(float2 p)
+    {
+        // GLSL mat2(0.8,-0.6,0.6,0.8) uses column-major constructor order.
+        return float2(0.8f * p.x + 0.6f * p.y,
+                     -0.6f * p.x + 0.8f * p.y);
+    }
+
+    float terrainHeightAt(float2 p)
+    {
+        p = p / terrainScale;
+        p += terrainOffset;
+
+        float2 d = float2(0.0f, 0.0f);
+        float3 n = float3(0.0f, 0.0f, 0.0f);
+        float na = 0.5f;
+        float2 pf = p;
+
+        for (int i = 0; i < terrainOctaves; ++i)
+        {
+            float3 nl = noised(pf);
+            n += nl * na / (1.0f + (d.x * d.x + d.y * d.y));
+            d += float2(nl.y, nl.z);
+            na *= terrainGain;
+            pf = rotateTerrainDomain(pf) * terrainLacunarity;
+            pf += float2(-d.y, d.x) * 0.1f; // Original curl warp.
+        }
+
+        return (n.x - terrainCenter) * terrainHeightAmount;
+    }
+
+    float3 terrainNormalAt(float3 p)
+    {
+        // Same forward-difference normal method as Buffer A.
+        float d = 1.0f;
+        float3 p0 = p;
+        float3 p1 = p + float3(d, 0.0f, 0.0f);
+        float3 p2 = p + float3(0.0f, 0.0f, d);
+        p0.y = terrainHeightAt(float2(p0.x, p0.z));
+        p1.y = terrainHeightAt(float2(p1.x, p1.z));
+        p2.y = terrainHeightAt(float2(p2.x, p2.z));
+
+        float3 a = p2 - p0;
+        float3 b = p1 - p0;
+        float3 c = float3(a.y * b.z - a.z * b.y,
+                          a.z * b.x - a.x * b.z,
+                          a.x * b.y - a.y * b.x);
+        return normalize(c);
+    }
+
+    float2 sphereIntersection(float3 rayStart, float3 rayDir,
+                              float3 sphereCenter, float sphereRadius)
+    {
+        float3 oc = rayStart - sphereCenter;
+        float b = oc.x * rayDir.x + oc.y * rayDir.y + oc.z * rayDir.z;
+        float c = oc.x * oc.x + oc.y * oc.y + oc.z * oc.z
+                - sphereRadius * sphereRadius;
+        float h = b * b - c;
+        if (h < 0.0f)
+            return float2(-1.0f, -1.0f);
+        h = sqrt(h);
+        return float2(-b - h, -b + h);
+    }
+
+    float4 marchTerrain(float3 ro, float3 rd)
+    {
+        float t = 0.0f;
+        float ds = 0.0f;
+
+        for (int i = 0; i < maxMarchSteps; ++i)
+        {
+            float3 p = ro + rd * t;
+            float h = p.y - terrainHeightAt(float2(p.x, p.z));
+            if (h < 0.0f)
+            {
+                t -= ds * 0.5f;
+                break;
+            }
+
+            ds = t * 1.0e-3f + h * 0.7f;
+            t += ds;
+            if (t > maxDistance)
+            {
+                t = -1.0f;
+                break;
+            }
+        }
+
+        // Preserve Buffer A's ordering: normal evaluation happens before the
+        // optional planet-intersection fallback is applied in process().
+        float3 normal = terrainNormalAt(ro + rd * t);
+        return float4(t, normal.x, normal.y, normal.z);
+    }
+
+    float smooth01(float a, float b, float x)
+    {
+        float t = clamp((x - a) / (b - a), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    void process(int2 pos)
+    {
+        float width = (float)dst.bounds.width();
+        float height = (float)dst.bounds.height();
+        float2 uv = float2(
+            ((float)(pos.x - dst.bounds.x1) + 0.5f) / width,
+            ((float)(pos.y - dst.bounds.y1) + 0.5f) / height);
+
+        // Common::GetCamera: fixed pinhole camera, origin XZ=(0,0), +Z forward.
+        float3 ro = float3(0.0f, cameraHeight, 0.0f);
+        float aspect = width / height;
+        float3 rd = normalize(float3((uv.x - 0.5f) * aspect,
+                                     uv.y - 0.5f,
+                                     cameraZ));
+
+        float4 march = marchTerrain(ro, rd);
+        float t = march.x;
+        float3 normal = float3(march.y, march.z, march.w);
+
+        // Preserve Buffer A's planetary horizon fallback. The procedural
+        // terrain itself remains a height field; this catches far horizon rays.
+        if (intersectPlanetFallback && t < 0.0f)
+        {
+            float2 planetT = sphereIntersection(ro, rd,
+                float3(0.0f, -planetRadius, 0.0f), planetRadius);
+            if (planetT.x > 0.0f)
+                t = planetT.x;
+        }
+
+        float detail = 0.0f;
+        if (t > 0.0f && computeTerrainDetail)
+        {
+            float3 p = ro + rd * t;
+            float d = curvatureStep;
+            // These paired samples intentionally mirror Buffer A, including
+            // its repeated offsets, so Buffer D's detail response stays close.
+            float3 n1 = terrainNormalAt(p - float3(d, 0.0f, 0.0f));
+            float3 n2 = terrainNormalAt(p + float3(0.0f, 0.0f, d));
+            float3 n3 = terrainNormalAt(p - float3(d, 0.0f, 0.0f));
+            float3 n4 = terrainNormalAt(p + float3(0.0f, 0.0f, d));
+            detail = (n1.x * n2.x + n1.y * n2.y + n1.z * n2.z
+                    + n3.x * n4.x + n3.y * n4.y + n3.z * n4.z) * 0.5f;
+        }
+        else if (t > 0.0f)
+        {
+            // Fast preview path: no extra normal probes; neutral detail value.
+            detail = 1.0f;
+        }
+
+        // Buffer A's original packing: distance, normal.xz, terrain detail.
+        // Unlike Shadertoy, alpha is not overloaded with a cache marker.
+        dst() = float4(t, normal.x, normal.z, detail);
+    }
+};
