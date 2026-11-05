@@ -1,0 +1,93 @@
+// Fast Atmosphere - optional final display transform for viewing
+//
+// Apply this ONLY at the end of the image pipeline, for preview/viewing.
+// It is not part of the scene-linear atmosphere computation and should not
+// be used for lighting, compositing, or a scene-linear render output.
+//
+// Modes:
+//   0 = Linear -> exact sRGB encoding (no tone mapping)
+//   1 = Exposure -> source-style ACES approximation -> exact sRGB encoding
+//   2 = Exposure -> source-style ACES approximation -> gamma 2.0 encoding
+//       (closest to the final CAM_TONEMAP + CAM_GAMMA portion in Shadertoy)
+//
+// The original shader also applies CAM_AUTO_EXPOSURE using atmosphere-specific
+// sky-radiance calculations. That is intentionally not duplicated here because
+// this generic final node has no access to the shader's internal sky radiance.
+// Use Exposure (stops) to adjust the viewing level manually.
+//
+// Input 0: RGBA image. RGB is expected to be scene-linear.
+// Output: transformed RGB, input alpha passed through unchanged.
+
+kernel post_processing : ImageComputationKernel<ePixelWise>
+{
+    Image<eRead, eAccessPoint> src;
+    Image<eWrite, eAccessPoint> dst;
+
+    param:
+        int displayMode;
+        float exposureStops;
+
+    void define()
+    {
+        defineParam(displayMode, "Display Transform Mode (0-2)", 2);
+        defineParam(exposureStops, "Exposure (stops)", 0.0f);
+    }
+
+    float srgbEncode(float x)
+    {
+        x = max(x, 0.0f);
+        if (x <= 0.0031308f)
+            return 12.92f * x;
+        return 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
+    }
+
+    void process(int2 pos)
+    {
+        float4 pixel = src();
+        float3 color = float3(pixel.x, pixel.y, pixel.z);
+
+        // Apply exposure per channel, using scalar arithmetic for BlinkScript compatibility.
+        float exposure = pow(2.0f, exposureStops);
+        color.x = color.x * exposure;
+        color.y = color.y * exposure;
+        color.z = color.z * exposure;
+
+        if (displayMode == 0)
+        {
+            // Exact piecewise sRGB transfer function; no tone mapping.
+            color = float3(srgbEncode(color.x),
+                           srgbEncode(color.y),
+                           srgbEncode(color.z));
+        }
+        else
+        {
+            // Same ACES-fit curve used by Fast-Atmosphere's Shadertoy Buffer D.
+            // Inline each scalar channel explicitly for BlinkScript compiler compatibility.
+            color.x = (color.x * (2.51f * color.x + 0.03f)) /
+                      (color.x * (2.43f * color.x + 0.59f) + 0.14f);
+            color.y = (color.y * (2.51f * color.y + 0.03f)) /
+                      (color.y * (2.43f * color.y + 0.59f) + 0.14f);
+            color.z = (color.z * (2.51f * color.z + 0.03f)) /
+                      (color.z * (2.43f * color.z + 0.59f) + 0.14f);
+            color.x = clamp(color.x, 0.0f, 1.0f);
+            color.y = clamp(color.y, 0.0f, 1.0f);
+            color.z = clamp(color.z, 0.0f, 1.0f);
+
+            if (displayMode == 1)
+            {
+                color = float3(srgbEncode(color.x),
+                               srgbEncode(color.y),
+                               srgbEncode(color.z));
+            }
+            else
+            {
+                // Source shader uses CAM_GAMMA 2.0 (pow(color, 1/2)).
+                color = float3(sqrt(max(color.x, 0.0f)),
+                               sqrt(max(color.y, 0.0f)),
+                               sqrt(max(color.z, 0.0f)));
+            }
+        }
+
+        dst() = float4(color.x, color.y, color.z, pixel.w);
+    }
+};
